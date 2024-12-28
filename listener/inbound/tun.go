@@ -34,7 +34,7 @@ type TunOption struct {
 	RouteExcludeAddress    []string `inbound:"route-exclude-address,omitempty"`
 	RouteExcludeAddressSet []string `inbound:"route-exclude-address-set,omitempty"`
 	IncludeInterface       []string `inbound:"include-interface,omitempty"`
-	ExcludeInterface       []string `inbound:"exclude-interface"`
+	ExcludeInterface       []string `inbound:"exclude-interface,omitempty"`
 	IncludeUID             []uint32 `inbound:"include-uid,omitempty"`
 	IncludeUIDRange        []string `inbound:"include-uid-range,omitempty"`
 	ExcludeUID             []uint32 `inbound:"exclude-uid,omitempty"`
