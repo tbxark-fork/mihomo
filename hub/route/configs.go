@@ -7,6 +7,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
@@ -33,28 +34,29 @@ func configRouter() http.Handler {
 }
 
 type configSchema struct {
-	Port              *int               `json:"port"`
-	SocksPort         *int               `json:"socks-port"`
-	RedirPort         *int               `json:"redir-port"`
-	TProxyPort        *int               `json:"tproxy-port"`
-	MixedPort         *int               `json:"mixed-port"`
-	Tun               *tunSchema         `json:"tun"`
-	TuicServer        *tuicServerSchema  `json:"tuic-server"`
-	ShadowSocksConfig *string            `json:"ss-config"`
-	VmessConfig       *string            `json:"vmess-config"`
-	TcptunConfig      *string            `json:"tcptun-config"`
-	UdptunConfig      *string            `json:"udptun-config"`
-	AllowLan          *bool              `json:"allow-lan"`
-	SkipAuthPrefixes  *[]netip.Prefix    `json:"skip-auth-prefixes"`
-	LanAllowedIPs     *[]netip.Prefix    `json:"lan-allowed-ips"`
-	LanDisAllowedIPs  *[]netip.Prefix    `json:"lan-disallowed-ips"`
-	BindAddress       *string            `json:"bind-address"`
-	Mode              *tunnel.TunnelMode `json:"mode"`
-	LogLevel          *log.LogLevel      `json:"log-level"`
-	IPv6              *bool              `json:"ipv6"`
-	Sniffing          *bool              `json:"sniffing"`
-	TcpConcurrent     *bool              `json:"tcp-concurrent"`
-	InterfaceName     *string            `json:"interface-name"`
+	Port              *int                     `json:"port"`
+	SocksPort         *int                     `json:"socks-port"`
+	RedirPort         *int                     `json:"redir-port"`
+	TProxyPort        *int                     `json:"tproxy-port"`
+	MixedPort         *int                     `json:"mixed-port"`
+	Tun               *tunSchema               `json:"tun"`
+	TuicServer        *tuicServerSchema        `json:"tuic-server"`
+	ShadowSocksConfig *string                  `json:"ss-config"`
+	VmessConfig       *string                  `json:"vmess-config"`
+	TcptunConfig      *string                  `json:"tcptun-config"`
+	UdptunConfig      *string                  `json:"udptun-config"`
+	AllowLan          *bool                    `json:"allow-lan"`
+	SkipAuthPrefixes  *[]netip.Prefix          `json:"skip-auth-prefixes"`
+	LanAllowedIPs     *[]netip.Prefix          `json:"lan-allowed-ips"`
+	LanDisAllowedIPs  *[]netip.Prefix          `json:"lan-disallowed-ips"`
+	BindAddress       *string                  `json:"bind-address"`
+	Mode              *tunnel.TunnelMode       `json:"mode"`
+	LogLevel          *log.LogLevel            `json:"log-level"`
+	IPv6              *bool                    `json:"ipv6"`
+	Sniffing          *bool                    `json:"sniffing"`
+	TcpConcurrent     *bool                    `json:"tcp-concurrent"`
+	FindProcessMode   *process.FindProcessMode `json:"find-process-mode"`
+	InterfaceName     *string                  `json:"interface-name"`
 }
 
 type tunSchema struct {
@@ -75,6 +77,7 @@ type tunSchema struct {
 	AutoRedirect           *bool           `yaml:"auto-redirect" json:"auto-redirect,omitempty"`
 	AutoRedirectInputMark  *uint32         `yaml:"auto-redirect-input-mark" json:"auto-redirect-input-mark,omitempty"`
 	AutoRedirectOutputMark *uint32         `yaml:"auto-redirect-output-mark" json:"auto-redirect-output-mark,omitempty"`
+	LoopbackAddress        *[]netip.Addr   `yaml:"loopback-address" json:"loopback-address,omitempty"`
 	StrictRoute            *bool           `yaml:"strict-route" json:"strict-route,omitempty"`
 	RouteAddress           *[]netip.Prefix `yaml:"route-address" json:"route-address,omitempty"`
 	RouteAddressSet        *[]string       `yaml:"route-address-set" json:"route-address-set,omitempty"`
@@ -97,6 +100,10 @@ type tunSchema struct {
 	Inet6RouteAddress        *[]netip.Prefix `yaml:"inet6-route-address" json:"inet6-route-address,omitempty"`
 	Inet4RouteExcludeAddress *[]netip.Prefix `yaml:"inet4-route-exclude-address" json:"inet4-route-exclude-address,omitempty"`
 	Inet6RouteExcludeAddress *[]netip.Prefix `yaml:"inet6-route-exclude-address" json:"inet6-route-exclude-address,omitempty"`
+
+	// darwin special config
+	RecvMsgX *bool `yaml:"recvmsgx" json:"recvmsgx,omitempty"`
+	SendMsgX *bool `yaml:"sendmsgx" json:"sendmsgx,omitempty"`
 }
 
 type tuicServerSchema struct {
@@ -174,6 +181,9 @@ func pointerOrDefaultTun(p *tunSchema, def LC.Tun) LC.Tun {
 		if p.AutoRedirectOutputMark != nil {
 			def.AutoRedirectOutputMark = *p.AutoRedirectOutputMark
 		}
+		if p.LoopbackAddress != nil {
+			def.LoopbackAddress = *p.LoopbackAddress
+		}
 		if p.StrictRoute != nil {
 			def.StrictRoute = *p.StrictRoute
 		}
@@ -236,6 +246,12 @@ func pointerOrDefaultTun(p *tunSchema, def LC.Tun) LC.Tun {
 		}
 		if p.FileDescriptor != nil {
 			def.FileDescriptor = *p.FileDescriptor
+		}
+		if p.RecvMsgX != nil {
+			def.RecvMsgX = *p.RecvMsgX
+		}
+		if p.SendMsgX != nil {
+			def.SendMsgX = *p.SendMsgX
 		}
 	}
 	return def
@@ -335,6 +351,10 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 
 	if general.Mode != nil {
 		tunnel.SetMode(*general.Mode)
+	}
+
+	if general.FindProcessMode != nil {
+		tunnel.SetFindProcessMode(*general.FindProcessMode)
 	}
 
 	if general.LogLevel != nil {

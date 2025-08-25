@@ -1,7 +1,6 @@
 package config
 
 import (
-	"container/list"
 	"errors"
 	"fmt"
 	"net"
@@ -157,6 +156,7 @@ type DNS struct {
 	EnhancedMode          C.DNSMode
 	DefaultNameserver     []dns.NameServer
 	CacheAlgorithm        string
+	CacheMaxSize          int
 	FakeIPRange           *fakeip.Pool
 	Hosts                 *trie.DomainTrie[resolver.HostValue]
 	NameServerPolicy      []dns.Policy
@@ -224,6 +224,7 @@ type RawDNS struct {
 	FakeIPFilterMode             C.FilterMode                        `yaml:"fake-ip-filter-mode" json:"fake-ip-filter-mode"`
 	DefaultNameserver            []string                            `yaml:"default-nameserver" json:"default-nameserver"`
 	CacheAlgorithm               string                              `yaml:"cache-algorithm" json:"cache-algorithm"`
+	CacheMaxSize                 int                                 `yaml:"cache-max-size" json:"cache-max-size"`
 	NameServerPolicy             *orderedmap.OrderedMap[string, any] `yaml:"nameserver-policy" json:"nameserver-policy"`
 	ProxyServerNameserver        []string                            `yaml:"proxy-server-nameserver" json:"proxy-server-nameserver"`
 	DirectNameServer             []string                            `yaml:"direct-nameserver" json:"direct-nameserver"`
@@ -270,6 +271,7 @@ type RawTun struct {
 	AutoRedirect           bool           `yaml:"auto-redirect" json:"auto-redirect,omitempty"`
 	AutoRedirectInputMark  uint32         `yaml:"auto-redirect-input-mark" json:"auto-redirect-input-mark,omitempty"`
 	AutoRedirectOutputMark uint32         `yaml:"auto-redirect-output-mark" json:"auto-redirect-output-mark,omitempty"`
+	LoopbackAddress        []netip.Addr   `yaml:"loopback-address" json:"loopback-address,omitempty"`
 	StrictRoute            bool           `yaml:"strict-route" json:"strict-route,omitempty"`
 	RouteAddress           []netip.Prefix `yaml:"route-address" json:"route-address,omitempty"`
 	RouteAddressSet        []string       `yaml:"route-address-set" json:"route-address-set,omitempty"`
@@ -296,6 +298,10 @@ type RawTun struct {
 	Inet6RouteAddress        []netip.Prefix `yaml:"inet6-route-address" json:"inet6-route-address,omitempty"`
 	Inet4RouteExcludeAddress []netip.Prefix `yaml:"inet4-route-exclude-address" json:"inet4-route-exclude-address,omitempty"`
 	Inet6RouteExcludeAddress []netip.Prefix `yaml:"inet6-route-exclude-address" json:"inet6-route-exclude-address,omitempty"`
+
+	// darwin special config
+	RecvMsgX bool `yaml:"recvmsgx" json:"recvmsgx,omitempty"`
+	SendMsgX bool `yaml:"sendmsgx" json:"sendmsgx,omitempty"`
 }
 
 type RawTuicServer struct {
@@ -513,6 +519,8 @@ func DefaultRawConfig() *RawConfig {
 			AutoRoute:           true,
 			AutoDetectInterface: true,
 			Inet6Address:        []netip.Prefix{netip.MustParsePrefix("fdfe:dcba:9876::1/126")},
+			RecvMsgX:            true,
+			SendMsgX:            false, // In the current implementation, if enabled, the kernel may freeze during multi-thread downloads, so it is disabled by default.
 		},
 		TuicServer: RawTuicServer{
 			Enable:                false,
@@ -837,8 +845,6 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		AllProxies []string
 		hasGlobal  bool
 	)
-	proxiesList := list.New()
-	groupsList := list.New()
 
 	proxies["DIRECT"] = adapter.NewProxy(outbound.NewDirect())
 	proxies["REJECT"] = adapter.NewProxy(outbound.NewReject())
@@ -860,7 +866,6 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		proxies[proxy.Name()] = proxy
 		proxyList = append(proxyList, proxy.Name())
 		AllProxies = append(AllProxies, proxy.Name())
-		proxiesList.PushBack(mapping)
 	}
 
 	// keep the original order of ProxyGroups in config file
@@ -873,7 +878,6 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 			hasGlobal = true
 		}
 		proxyList = append(proxyList, groupName)
-		groupsList.PushBack(mapping)
 	}
 
 	// check if any loop exists and sort the ProxyGroups
@@ -1039,46 +1043,20 @@ func parseRules(rulesConfig []string, proxies map[string]C.Proxy, ruleProviders 
 
 	// parse rules
 	for idx, line := range rulesConfig {
-		rule := trimArr(strings.Split(line, ","))
-		var (
-			payload  string
-			target   string
-			params   []string
-			ruleName = strings.ToUpper(rule[0])
-		)
-
-		l := len(rule)
-
-		if ruleName == "NOT" || ruleName == "OR" || ruleName == "AND" || ruleName == "SUB-RULE" || ruleName == "DOMAIN-REGEX" || ruleName == "PROCESS-NAME-REGEX" || ruleName == "PROCESS-PATH-REGEX" {
-			target = rule[l-1]
-			payload = strings.Join(rule[1:l-1], ",")
-		} else {
-			if l < 2 {
-				return nil, fmt.Errorf("%s[%d] [%s] error: format invalid", format, idx, line)
-			}
-			if l < 4 {
-				rule = append(rule, make([]string, 4-l)...)
-			}
-			if ruleName == "MATCH" {
-				l = 2
-			}
-			if l >= 3 {
-				l = 3
-				payload = rule[1]
-			}
-			target = rule[l-1]
-			params = rule[l:]
+		tp, payload, target, params := RC.ParseRulePayload(line, true)
+		if target == "" {
+			return nil, fmt.Errorf("%s[%d] [%s] error: format invalid", format, idx, line)
 		}
+
 		if _, ok := proxies[target]; !ok {
-			if ruleName != "SUB-RULE" {
+			if tp != "SUB-RULE" {
 				return nil, fmt.Errorf("%s[%d] [%s] error: proxy [%s] not found", format, idx, line, target)
 			} else if _, ok = subRules[target]; !ok {
 				return nil, fmt.Errorf("%s[%d] [%s] error: sub-rule [%s] not found", format, idx, line, target)
 			}
 		}
 
-		params = trimArr(params)
-		parsed, parseErr := R.ParseRule(ruleName, payload, target, params, subRules)
+		parsed, parseErr := R.ParseRule(tp, payload, target, params, subRules)
 		if parseErr != nil {
 			return nil, fmt.Errorf("%s[%d] [%s] error: %s", format, idx, line, parseErr.Error())
 		}
@@ -1168,10 +1146,19 @@ func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.
 			return nil, fmt.Errorf("DNS NameServer[%d] format error: %s", idx, err.Error())
 		}
 
-		proxyName := u.Fragment
+		var proxyName string
+		params := map[string]string{}
+		for _, s := range strings.Split(u.Fragment, "&") {
+			arr := strings.SplitN(s, "=", 2)
+			switch len(arr) {
+			case 1:
+				proxyName = arr[0]
+			case 2:
+				params[arr[0]] = arr[1]
+			}
+		}
 
 		var addr, dnsNetType string
-		params := map[string]string{}
 		switch u.Scheme {
 		case "udp":
 			addr, err = hostWithDefaultPort(u.Host, "53")
@@ -1189,23 +1176,8 @@ func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.
 				addr, err = hostWithDefaultPort(u.Host, "80")
 			}
 			if err == nil {
-				proxyName = ""
 				clearURL := url.URL{Scheme: u.Scheme, Host: addr, Path: u.Path, User: u.User}
 				addr = clearURL.String()
-				if len(u.Fragment) != 0 {
-					for _, s := range strings.Split(u.Fragment, "&") {
-						arr := strings.Split(s, "=")
-						if len(arr) == 0 {
-							continue
-						} else if len(arr) == 1 {
-							proxyName = arr[0]
-						} else if len(arr) == 2 {
-							params[arr[0]] = arr[1]
-						} else {
-							params[arr[0]] = strings.Join(arr[1:], "=")
-						}
-					}
-				}
 			}
 		case "quic":
 			addr, err = hostWithDefaultPort(u.Host, "853")
@@ -1382,6 +1354,8 @@ func parseDNS(rawCfg *RawConfig, hosts *trie.DomainTrie[resolver.HostValue], rul
 		IPv6:           cfg.IPv6,
 		UseSystemHosts: cfg.UseSystemHosts,
 		EnhancedMode:   cfg.EnhancedMode,
+		CacheAlgorithm: cfg.CacheAlgorithm,
+		CacheMaxSize:   cfg.CacheMaxSize,
 	}
 	var err error
 	if dnsCfg.NameServer, err = parseNameServer(cfg.NameServer, cfg.RespectRules, cfg.PreferH3); err != nil {
@@ -1515,12 +1489,6 @@ func parseDNS(rawCfg *RawConfig, hosts *trie.DomainTrie[resolver.HostValue], rul
 		dnsCfg.Hosts = hosts
 	}
 
-	if cfg.CacheAlgorithm == "" || cfg.CacheAlgorithm == "lru" {
-		dnsCfg.CacheAlgorithm = "lru"
-	} else {
-		dnsCfg.CacheAlgorithm = "arc"
-	}
-
 	return dnsCfg, nil
 }
 
@@ -1563,6 +1531,7 @@ func parseTun(rawTun RawTun, general *General) error {
 		AutoRedirect:           rawTun.AutoRedirect,
 		AutoRedirectInputMark:  rawTun.AutoRedirectInputMark,
 		AutoRedirectOutputMark: rawTun.AutoRedirectOutputMark,
+		LoopbackAddress:        rawTun.LoopbackAddress,
 		StrictRoute:            rawTun.StrictRoute,
 		RouteAddress:           rawTun.RouteAddress,
 		RouteAddressSet:        rawTun.RouteAddressSet,
@@ -1589,6 +1558,9 @@ func parseTun(rawTun RawTun, general *General) error {
 		Inet6RouteAddress:        rawTun.Inet6RouteAddress,
 		Inet4RouteExcludeAddress: rawTun.Inet4RouteExcludeAddress,
 		Inet6RouteExcludeAddress: rawTun.Inet6RouteExcludeAddress,
+
+		RecvMsgX: rawTun.RecvMsgX,
+		SendMsgX: rawTun.SendMsgX,
 	}
 
 	return nil
