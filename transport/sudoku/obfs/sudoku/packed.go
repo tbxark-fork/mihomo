@@ -2,44 +2,41 @@ package sudoku
 
 import (
 	"bufio"
-	crypto_rand "crypto/rand"
-	"encoding/binary"
 	"io"
-	"math/rand"
 	"net"
 	"sync"
 )
 
 const (
-	// 每次从 RNG 获取批量随机数的缓存大小，减少 RNG 函数调用开销
-	RngBatchSize = 128
+	packedProtectedPrefixBytes = 14
+	packedIOBufferSize         = 32 * 1024
+	packedDecodeBufferSize     = 32 * 1024
 )
 
-// 1. 使用 12字节->16组 的块处理优化 Write (减少循环开销)
-// 2. 使用整数阈值随机概率判断 Padding，与纯 Sudoku 保持流量特征一致
-// 3. Read 使用 copy 移动避免底层数组泄漏
+// PackedConn encodes traffic with the packed Sudoku layout while preserving
+// the same padding model as the regular connection.
 type PackedConn struct {
 	net.Conn
 	table  *Table
 	reader *bufio.Reader
 
-	// 读缓冲
+	// Read-side buffers.
 	rawBuf      []byte
-	pendingData []byte // 解码后尚未被 Read 取走的字节
+	pendingData pendingBuffer
 
-	// 写缓冲与状态
+	// Write-side state.
 	writeMu  sync.Mutex
 	writeBuf []byte
-	bitBuf   uint64 // 暂存的位数据
-	bitCount int    // 暂存的位数
+	bitBuf   uint64
+	bitCount int
 
-	// 读状态
+	// Read-side bit accumulator.
 	readBitBuf uint64
 	readBits   int
 
-	// 随机数与填充控制 - 使用整数阈值随机，与 Conn 一致
-	rng              *rand.Rand
-	paddingThreshold uint64 // 与 Conn 保持一致的随机概率模型
+	// Padding selection matches Conn's threshold-based model.
+	rng              *sudokuRand
+	paddingThreshold uint64
 	padMarker        byte
 	padPool          []byte
 }
@@ -65,28 +62,25 @@ func (pc *PackedConn) CloseRead() error {
 }
 
 func NewPackedConn(c net.Conn, table *Table, pMin, pMax int) *PackedConn {
-	var seedBytes [8]byte
-	if _, err := crypto_rand.Read(seedBytes[:]); err != nil {
-		binary.BigEndian.PutUint64(seedBytes[:], uint64(rand.Int63()))
-	}
-	seed := int64(binary.BigEndian.Uint64(seedBytes[:]))
-	localRng := rand.New(rand.NewSource(seed))
+	localRng := newSeededRand()
 
 	pc := &PackedConn{
 		Conn:             c,
 		table:            table,
-		reader:           bufio.NewReaderSize(c, IOBufferSize),
-		rawBuf:           make([]byte, IOBufferSize),
-		pendingData:      make([]byte, 0, 4096),
+		reader:           bufio.NewReaderSize(c, packedIOBufferSize),
+		rawBuf:           make([]byte, packedDecodeBufferSize),
+		pendingData:      newPendingBuffer(4096),
 		writeBuf:         make([]byte, 0, 4096),
 		rng:              localRng,
 		paddingThreshold: pickPaddingThreshold(localRng, pMin, pMax),
 	}
 
-	pc.padMarker = table.layout.padMarker
-	for _, b := range table.PaddingPool {
-		if b != pc.padMarker {
-			pc.padPool = append(pc.padPool, b)
+	if table != nil && table.layout != nil {
+		pc.padMarker = table.layout.padMarker
+		for _, b := range table.PaddingPool {
+			if b != pc.padMarker {
+				pc.padPool = append(pc.padPool, b)
+			}
 		}
 	}
 	if len(pc.padPool) == 0 {
@@ -95,37 +89,106 @@ func NewPackedConn(c net.Conn, table *Table, pMin, pMax int) *PackedConn {
 	return pc
 }
 
-// maybeAddPadding 内联辅助：根据概率阈值插入 padding
-func (pc *PackedConn) maybeAddPadding(out []byte) []byte {
-	if shouldPad(pc.rng, pc.paddingThreshold) {
-		out = append(out, pc.getPaddingByte())
+func (pc *PackedConn) appendForcedPadding(out []byte) []byte {
+	return append(out, pc.getPaddingByte())
+}
+
+func (pc *PackedConn) nextProtectedPrefixGap() int {
+	return 1 + pc.rng.Intn(2)
+}
+
+func (pc *PackedConn) writeProtectedPrefix(out []byte, p []byte) ([]byte, int) {
+	if len(p) == 0 {
+		return out, 0
+	}
+
+	limit := len(p)
+	if limit > packedProtectedPrefixBytes {
+		limit = packedProtectedPrefixBytes
+	}
+
+	for padCount := 0; padCount < 1+pc.rng.Intn(2); padCount++ {
+		out = pc.appendForcedPadding(out)
+	}
+
+	gap := pc.nextProtectedPrefixGap()
+	effective := 0
+	for i := 0; i < limit; i++ {
+		pc.bitBuf = (pc.bitBuf << 8) | uint64(p[i])
+		pc.bitCount += 8
+		for pc.bitCount >= 6 {
+			pc.bitCount -= 6
+			group := byte(pc.bitBuf >> pc.bitCount)
+			if pc.bitCount == 0 {
+				pc.bitBuf = 0
+			} else {
+				pc.bitBuf &= (1 << pc.bitCount) - 1
+			}
+			out = appendPackedGroup(out, pc.table.layout, pc.rng, pc.paddingThreshold, pc.padPool, group)
+		}
+
+		effective++
+		if effective >= gap {
+			out = pc.appendForcedPadding(out)
+			effective = 0
+			gap = pc.nextProtectedPrefixGap()
+		}
+	}
+
+	return out, limit
+}
+
+func appendPackedGroup(out []byte, layout *byteLayout, rng *sudokuRand, paddingThreshold uint64, padPool []byte, group byte) []byte {
+	if paddingThreshold != 0 {
+		u := rng.Uint32()
+		if uint64(u) < paddingThreshold {
+			out = append(out, padPool[fastIntnFromUint32(rng.Uint32(), len(padPool))])
+		}
+	}
+	return append(out, layout.encodeGroup[group&0x3F])
+}
+
+func maybeAppendPackedPadding(out []byte, rng *sudokuRand, paddingThreshold uint64, padPool []byte) []byte {
+	if paddingThreshold != 0 {
+		u := rng.Uint32()
+		if uint64(u) < paddingThreshold {
+			out = append(out, padPool[fastIntnFromUint32(rng.Uint32(), len(padPool))])
+		}
 	}
 	return out
 }
 
-// Write 极致优化版 - 批量处理 12 字节
 func (pc *PackedConn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if pc == nil || pc.Conn == nil || pc.table == nil || pc.table.layout == nil || pc.rng == nil || len(pc.padPool) == 0 {
+		return 0, io.ErrClosedPipe
 	}
 
 	pc.writeMu.Lock()
 	defer pc.writeMu.Unlock()
 
-	// 1. 预分配内存，避免 append 导致的多次扩容
-	// 预估：原数据 * 1.5 (4/3 + padding 余量)
 	needed := len(p)*3/2 + 32
+	if pc.paddingThreshold == 0 {
+		needed = ((len(p)+2)/3)*4 + 32
+	}
 	if cap(pc.writeBuf) < needed {
 		pc.writeBuf = make([]byte, 0, needed)
 	}
 	out := pc.writeBuf[:0]
+	layout := pc.table.layout
+	rng := pc.rng
+	paddingThreshold := pc.paddingThreshold
+	padPool := pc.padPool
 
-	i := 0
+	var prefixN int
+	out, prefixN = pc.writeProtectedPrefix(out, p)
+
+	i := prefixN
 	n := len(p)
 
-	// 2. 头部对齐处理 (Slow Path)
 	for pc.bitCount > 0 && i < n {
-		out = pc.maybeAddPadding(out)
 		b := p[i]
 		i++
 		pc.bitBuf = (pc.bitBuf << 8) | uint64(b)
@@ -138,14 +201,11 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 			} else {
 				pc.bitBuf &= (1 << pc.bitCount) - 1
 			}
-			out = pc.maybeAddPadding(out)
-			out = append(out, pc.encodeGroup(group&0x3F))
+			out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, group)
 		}
 	}
 
-	// 3. 极速批量处理 (Fast Path) - 每次处理 12 字节 → 生成 16 个编码组
 	for i+11 < n {
-		// 处理 4 组，每组 3 字节
 		for batch := 0; batch < 4; batch++ {
 			b1, b2, b3 := p[i], p[i+1], p[i+2]
 			i += 3
@@ -155,19 +215,13 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 			g3 := ((b2 & 0x0F) << 2) | ((b3 >> 6) & 0x03)
 			g4 := b3 & 0x3F
 
-			// 每个组之前都有概率插入 padding
-			out = pc.maybeAddPadding(out)
-			out = append(out, pc.encodeGroup(g1))
-			out = pc.maybeAddPadding(out)
-			out = append(out, pc.encodeGroup(g2))
-			out = pc.maybeAddPadding(out)
-			out = append(out, pc.encodeGroup(g3))
-			out = pc.maybeAddPadding(out)
-			out = append(out, pc.encodeGroup(g4))
+			out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, g1)
+			out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, g2)
+			out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, g3)
+			out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, g4)
 		}
 	}
 
-	// 4. 处理剩余的 3 字节块
 	for i+2 < n {
 		b1, b2, b3 := p[i], p[i+1], p[i+2]
 		i += 3
@@ -177,17 +231,12 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 		g3 := ((b2 & 0x0F) << 2) | ((b3 >> 6) & 0x03)
 		g4 := b3 & 0x3F
 
-		out = pc.maybeAddPadding(out)
-		out = append(out, pc.encodeGroup(g1))
-		out = pc.maybeAddPadding(out)
-		out = append(out, pc.encodeGroup(g2))
-		out = pc.maybeAddPadding(out)
-		out = append(out, pc.encodeGroup(g3))
-		out = pc.maybeAddPadding(out)
-		out = append(out, pc.encodeGroup(g4))
+		out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, g1)
+		out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, g2)
+		out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, g3)
+		out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, g4)
 	}
 
-	// 5. 尾部处理 (Tail Path) - 处理剩余的 1 或 2 个字节
 	for ; i < n; i++ {
 		b := p[i]
 		pc.bitBuf = (pc.bitBuf << 8) | uint64(b)
@@ -200,36 +249,36 @@ func (pc *PackedConn) Write(p []byte) (int, error) {
 			} else {
 				pc.bitBuf &= (1 << pc.bitCount) - 1
 			}
-			out = pc.maybeAddPadding(out)
-			out = append(out, pc.encodeGroup(group&0x3F))
+			out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, group)
 		}
 	}
 
-	// 6. 处理残留位
 	if pc.bitCount > 0 {
-		out = pc.maybeAddPadding(out)
 		group := byte(pc.bitBuf << (6 - pc.bitCount))
 		pc.bitBuf = 0
 		pc.bitCount = 0
-		out = append(out, pc.encodeGroup(group&0x3F))
+		out = appendPackedGroup(out, layout, rng, paddingThreshold, padPool, group)
 		out = append(out, pc.padMarker)
 	}
 
-	// 尾部可能添加 padding
-	out = pc.maybeAddPadding(out)
+	out = maybeAppendPackedPadding(out, rng, paddingThreshold, padPool)
 
-	// 发送数据
 	if len(out) > 0 {
-		_, err := pc.Conn.Write(out)
 		pc.writeBuf = out[:0]
-		return len(p), err
+		if _, err := pc.Conn.Write(out); err != nil {
+			return len(p), err
+		}
+		return len(p), nil
 	}
 	pc.writeBuf = out[:0]
 	return len(p), nil
 }
 
-// Flush 处理最后不足 6 bit 的情况
 func (pc *PackedConn) Flush() error {
+	if pc == nil || pc.Conn == nil || pc.table == nil || pc.table.layout == nil || pc.rng == nil || len(pc.padPool) == 0 {
+		return io.ErrClosedPipe
+	}
+
 	pc.writeMu.Lock()
 	defer pc.writeMu.Unlock()
 
@@ -239,49 +288,60 @@ func (pc *PackedConn) Flush() error {
 		pc.bitBuf = 0
 		pc.bitCount = 0
 
-		out = append(out, pc.encodeGroup(group&0x3F))
+		out = append(out, pc.table.layout.groupByte(group&0x3F))
 		out = append(out, pc.padMarker)
 	}
 
-	// 尾部随机添加 padding
-	out = pc.maybeAddPadding(out)
+	out = maybeAppendPackedPadding(out, pc.rng, pc.paddingThreshold, pc.padPool)
 
 	if len(out) > 0 {
-		_, err := pc.Conn.Write(out)
 		pc.writeBuf = out[:0]
+		_, err := pc.Conn.Write(out)
 		return err
 	}
 	return nil
 }
 
-// Read 优化版：减少切片操作，避免内存泄漏
 func (pc *PackedConn) Read(p []byte) (int, error) {
-	// 1. 优先返回待处理区的数据
-	if len(pc.pendingData) > 0 {
-		n := copy(p, pc.pendingData)
-		if n == len(pc.pendingData) {
-			pc.pendingData = pc.pendingData[:0]
-		} else {
-			// 优化：移动剩余数据到数组头部，避免切片指向中间导致内存泄漏
-			remaining := len(pc.pendingData) - n
-			copy(pc.pendingData, pc.pendingData[n:])
-			pc.pendingData = pc.pendingData[:remaining]
-		}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if pc == nil || pc.Conn == nil || pc.reader == nil || len(pc.rawBuf) == 0 || pc.table == nil || pc.table.layout == nil {
+		return 0, io.ErrClosedPipe
+	}
+	if n, ok := drainPending(p, &pc.pendingData); ok {
 		return n, nil
 	}
 
-	// 2. 循环读取直到解出数据或出错
+	outN := 0
 	for {
-		nr, rErr := pc.reader.Read(pc.rawBuf)
+		nr, rErr := readRawLimited(pc.Conn, pc.reader, pc.rawBuf[:packedReadSize(len(p)-outN, len(pc.rawBuf))])
 		if nr > 0 {
-			// 缓存频繁访问的变量
 			rBuf := pc.readBitBuf
 			rBits := pc.readBits
 			padMarker := pc.padMarker
 			layout := pc.table.layout
 
-			for _, b := range pc.rawBuf[:nr] {
-				if !layout.isHint(b) {
+			chunk := pc.rawBuf[:nr]
+			for i := 0; i < len(chunk); {
+				if rBits == 0 && outN+3 <= len(p) && i+3 < len(chunk) &&
+					layout.hintTable[chunk[i]] && layout.hintTable[chunk[i+1]] &&
+					layout.hintTable[chunk[i+2]] && layout.hintTable[chunk[i+3]] {
+					g1 := layout.decodeGroup[chunk[i]]
+					g2 := layout.decodeGroup[chunk[i+1]]
+					g3 := layout.decodeGroup[chunk[i+2]]
+					g4 := layout.decodeGroup[chunk[i+3]]
+					p[outN] = (g1 << 2) | (g2 >> 4)
+					p[outN+1] = (g2 << 4) | (g3 >> 2)
+					p[outN+2] = (g3 << 6) | g4
+					outN += 3
+					i += 4
+					continue
+				}
+
+				b := chunk[i]
+				i++
+				if !layout.hintTable[b] {
 					if b == padMarker {
 						rBuf = 0
 						rBits = 0
@@ -289,7 +349,7 @@ func (pc *PackedConn) Read(p []byte) (int, error) {
 					continue
 				}
 
-				group, ok := layout.decodeGroup(b)
+				group, ok := layout.decodePackedGroup(b)
 				if !ok {
 					return 0, ErrInvalidSudokuMapMiss
 				}
@@ -300,7 +360,12 @@ func (pc *PackedConn) Read(p []byte) (int, error) {
 				if rBits >= 8 {
 					rBits -= 8
 					val := byte(rBuf >> rBits)
-					pc.pendingData = append(pc.pendingData, val)
+					outN = appendDecodedByte(p, outN, &pc.pendingData, val)
+					if rBits == 0 {
+						rBuf = 0
+					} else {
+						rBuf &= (uint64(1) << rBits) - 1
+					}
 				}
 			}
 
@@ -313,35 +378,32 @@ func (pc *PackedConn) Read(p []byte) (int, error) {
 				pc.readBitBuf = 0
 				pc.readBits = 0
 			}
-			if len(pc.pendingData) > 0 {
-				break
+			if outN > 0 {
+				return outN, nil
+			}
+			if n, ok := drainPending(p, &pc.pendingData); ok {
+				return n, nil
 			}
 			return 0, rErr
 		}
 
-		if len(pc.pendingData) > 0 {
-			break
+		if outN > 0 {
+			return outN, nil
 		}
 	}
-
-	// 3. 返回解码后的数据 - 优化：避免底层数组泄漏
-	n := copy(p, pc.pendingData)
-	if n == len(pc.pendingData) {
-		pc.pendingData = pc.pendingData[:0]
-	} else {
-		remaining := len(pc.pendingData) - n
-		copy(pc.pendingData, pc.pendingData[n:])
-		pc.pendingData = pc.pendingData[:remaining]
-	}
-	return n, nil
 }
 
-// getPaddingByte 从 Pool 中随机取 Padding 字节
 func (pc *PackedConn) getPaddingByte() byte {
 	return pc.padPool[pc.rng.Intn(len(pc.padPool))]
 }
 
-// encodeGroup 编码 6-bit 组
-func (pc *PackedConn) encodeGroup(group byte) byte {
-	return pc.table.layout.encodeGroup(group)
+func packedReadSize(decodedRemaining, maxRaw int) int {
+	if maxRaw <= minDecodeReadSize || decodedRemaining <= 0 {
+		return maxRaw
+	}
+	if decodedRemaining > (maxRaw-minDecodeReadSize)/2 {
+		return maxRaw
+	}
+
+	return decodedRemaining*2 + minDecodeReadSize
 }

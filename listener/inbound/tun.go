@@ -48,8 +48,11 @@ type TunOption struct {
 	IncludeAndroidUser                    []int          `inbound:"include-android-user,omitempty"`
 	IncludePackage                        []string       `inbound:"include-package,omitempty"`
 	ExcludePackage                        []string       `inbound:"exclude-package,omitempty"`
+	IncludeMACAddress                     []string       `inbound:"include-mac-address,omitempty"`
+	ExcludeMACAddress                     []string       `inbound:"exclude-mac-address,omitempty"`
 	EndpointIndependentNat                bool           `inbound:"endpoint-independent-nat,omitempty"`
 	UDPTimeout                            int64          `inbound:"udp-timeout,omitempty"`
+	ICMPTimeout                           int64          `inbound:"icmp-timeout,omitempty"`
 	DisableICMPForwarding                 bool           `inbound:"disable-icmp-forwarding,omitempty"`
 	FileDescriptor                        int            `inbound:"file-descriptor,omitempty"`
 
@@ -123,8 +126,11 @@ func NewTun(options *TunOption) (*Tun, error) {
 			IncludeAndroidUser:                    options.IncludeAndroidUser,
 			IncludePackage:                        options.IncludePackage,
 			ExcludePackage:                        options.ExcludePackage,
+			IncludeMACAddress:                     options.IncludeMACAddress,
+			ExcludeMACAddress:                     options.ExcludeMACAddress,
 			EndpointIndependentNat:                options.EndpointIndependentNat,
 			UDPTimeout:                            options.UDPTimeout,
+			ICMPTimeout:                           options.ICMPTimeout,
 			DisableICMPForwarding:                 options.DisableICMPForwarding,
 			FileDescriptor:                        options.FileDescriptor,
 

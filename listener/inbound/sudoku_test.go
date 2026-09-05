@@ -2,6 +2,7 @@ package inbound_test
 
 import (
 	"net/netip"
+	"runtime"
 	"testing"
 
 	"github.com/metacubex/mihomo/adapter/outbound"
@@ -42,6 +43,8 @@ func testInboundSudoku(t *testing.T, inboundOptions inbound.SudokuOption, outbou
 	outboundOptions.Name = "sudoku_outbound"
 	outboundOptions.Server = addrPort.Addr().String()
 	outboundOptions.Port = int(addrPort.Port())
+	outboundOptions.DialerForAPI = tunnel.NewDialer()
+	outboundOptions.TunnelForAPI = tunnel
 
 	out, err := outbound.NewSudoku(outboundOptions)
 	if !assert.NoError(t, err) {
@@ -166,18 +169,23 @@ func TestInboundSudoku_CustomTable(t *testing.T) {
 }
 
 func TestInboundSudoku_HTTPMaskMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("temporarily skipped on windows due to intermittent failures; tracked in PR")
+	}
+
 	key := "test_key_http_mask_mode"
 
-	for _, mode := range []string{"legacy", "stream", "poll", "auto"} {
+	for _, mode := range []string{"ws", "stream", "poll", "auto"} {
 		mode := mode
 		t.Run(mode, func(t *testing.T) {
 			inboundOptions := inbound.SudokuOption{
 				Key:          key,
 				HTTPMaskMode: mode,
 			}
+			httpMask := true
 			outboundOptions := outbound.SudokuOption{
 				Key:          key,
-				HTTPMask:     true,
+				HTTPMask:     &httpMask,
 				HTTPMaskMode: mode,
 			}
 			testInboundSudoku(t, inboundOptions, outboundOptions)

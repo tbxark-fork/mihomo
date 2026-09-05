@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/transport/sudoku/multiplex"
 	sudokuobfs "github.com/metacubex/mihomo/transport/sudoku/obfs/sudoku"
 )
 
@@ -18,7 +19,6 @@ func TestUserHash_StableAcrossTableRotation(t *testing.T) {
 		sudokuobfs.NewTable("seed-b", "prefer_ascii"),
 	}
 	key := "userhash-stability-key"
-	target := "example.com:80"
 
 	serverCfg := DefaultConfig()
 	serverCfg.Key = key
@@ -48,13 +48,16 @@ func TestUserHash_StableAcrossTableRotation(t *testing.T) {
 			}
 			go func(conn net.Conn) {
 				defer conn.Close()
-				session, err := ServerHandshake(conn, serverCfg)
+				_, meta, err := ServerHandshake(conn, serverCfg)
 				if err != nil {
 					errCh <- err
 					return
 				}
-				defer session.Conn.Close()
-				hashCh <- session.UserHash
+				if meta == nil || meta.UserHash == "" {
+					errCh <- io.ErrUnexpectedEOF
+					return
+				}
+				hashCh <- meta.UserHash
 			}(c)
 		}
 	}()
@@ -77,15 +80,6 @@ func TestUserHash_StableAcrossTableRotation(t *testing.T) {
 			t.Fatalf("handshake %d: %v", i, err)
 		}
 
-		addrBuf, err := EncodeAddress(target)
-		if err != nil {
-			_ = cConn.Close()
-			t.Fatalf("encode addr %d: %v", i, err)
-		}
-		if _, err := cConn.Write(addrBuf); err != nil {
-			_ = cConn.Close()
-			t.Fatalf("write addr %d: %v", i, err)
-		}
 		_ = cConn.Close()
 	}
 
@@ -145,18 +139,22 @@ func TestMultiplex_TCP_Echo(t *testing.T) {
 		}
 		defer raw.Close()
 
-		session, err := ServerHandshake(raw, serverCfg)
+		c, meta, err := ServerHandshake(raw, serverCfg)
 		if err != nil {
 			return
 		}
 		atomic.AddInt64(&handshakes, 1)
 
+		session, err := ReadServerSession(c, meta)
+		if err != nil {
+			return
+		}
 		if session.Type != SessionTypeMultiplex {
-			_ = session.Conn.Close()
+			_ = c.Close()
 			return
 		}
 
-		mux, err := AcceptMultiplexServer(session.Conn)
+		mux, err := AcceptMultiplexServer(c)
 		if err != nil {
 			return
 		}
@@ -197,7 +195,7 @@ func TestMultiplex_TCP_Echo(t *testing.T) {
 		t.Fatalf("client handshake: %v", err)
 	}
 
-	mux, err := StartMultiplexClient(cConn)
+	mux, err := StartMultiplexClient(context.Background(), cConn)
 	if err != nil {
 		_ = cConn.Close()
 		t.Fatalf("start mux: %v", err)
@@ -241,20 +239,89 @@ func TestMultiplex_TCP_Echo(t *testing.T) {
 	}
 }
 
-func TestMultiplex_Boundary_InvalidVersion(t *testing.T) {
-	client, server := net.Pipe()
-	t.Cleanup(func() { _ = client.Close() })
-	t.Cleanup(func() { _ = server.Close() })
-
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := AcceptMultiplexServer(server)
-		errCh <- err
-	}()
-
-	// AcceptMultiplexServer expects the magic byte to have been consumed already; write a bad version byte.
-	_, _ = client.Write([]byte{0xFF})
-	if err := <-errCh; err == nil {
-		t.Fatalf("expected error")
+func TestMultiplexDialerMaintainReconnectsClosedSession(t *testing.T) {
+	var calls atomic.Int32
+	peers := make(chan net.Conn, 2)
+	dialer, err := NewMultiplexDialer(func(context.Context) (net.Conn, error) {
+		calls.Add(1)
+		clientConn, serverConn := net.Pipe()
+		peers <- serverConn
+		return clientConn, nil
+	})
+	if err != nil {
+		t.Fatalf("new dialer: %v", err)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		dialer.Maintain(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = dialer.Close()
+		<-done
+	})
+
+	firstServer := startTestMultiplexPeer(t, <-peers)
+	_ = firstServer.Close()
+
+	select {
+	case peer := <-peers:
+		server := startTestMultiplexPeer(t, peer)
+		t.Cleanup(func() { _ = server.Close() })
+	case <-time.After(2 * time.Second):
+		t.Fatalf("maintainer did not reconnect; base dial count=%d", calls.Load())
+	}
+}
+
+func TestMultiplexDialerCloseCancelsCreation(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	dialer, err := NewMultiplexDialer(func(ctx context.Context) (net.Conn, error) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return nil, ctx.Err()
+	})
+	if err != nil {
+		t.Fatalf("new dialer: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		dialer.Maintain(context.Background())
+	}()
+	<-started
+	if err := dialer.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("base dial was not canceled")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("maintainer did not stop")
+	}
+}
+
+func startTestMultiplexPeer(t *testing.T, conn net.Conn) *multiplex.Session {
+	t.Helper()
+	msg, err := ReadKIPMessage(conn)
+	if err != nil {
+		t.Fatalf("read mux start: %v", err)
+	}
+	if msg.Type != KIPTypeStartMux || len(msg.Payload) != 0 {
+		t.Fatalf("unexpected mux start: type=%d payload=%d", msg.Type, len(msg.Payload))
+	}
+	session, err := multiplex.NewServerSession(conn)
+	if err != nil {
+		t.Fatalf("new server session: %v", err)
+	}
+	return session
 }

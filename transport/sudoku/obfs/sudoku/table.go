@@ -4,9 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"log"
 	"math/rand"
-	"time"
+	"strings"
 )
 
 var (
@@ -19,6 +18,8 @@ type Table struct {
 	PaddingPool []byte
 	IsASCII     bool // 标记当前模式
 	layout      *byteLayout
+	opposite    *Table
+	hint        uint32
 }
 
 // NewTable initializes the obfuscation tables with built-in layouts.
@@ -26,17 +27,46 @@ type Table struct {
 func NewTable(key string, mode string) *Table {
 	t, err := NewTableWithCustom(key, mode, "")
 	if err != nil {
-		log.Panicf("failed to build table: %v", err)
+		panic(err)
 	}
 	return t
 }
 
-// NewTableWithCustom initializes obfuscation tables using either predefined or custom layouts.
-// mode: "prefer_ascii" or "prefer_entropy". If a custom pattern is provided, ASCII mode still takes precedence.
+// NewTableWithCustom initializes the uplink/probe Sudoku table using either predefined
+// or directional layouts. Directional modes such as "up_ascii_down_entropy" return the
+// client->server table and internally attach the opposite direction table for runtime use.
 // The customPattern must contain 8 characters with exactly 2 x, 2 p, and 4 v (case-insensitive).
 func NewTableWithCustom(key string, mode string, customPattern string) (*Table, error) {
-	start := time.Now()
+	asciiMode, err := ParseASCIIMode(mode)
+	if err != nil {
+		return nil, err
+	}
 
+	uplinkPattern := customPatternForToken(asciiMode.Uplink, customPattern)
+	downlinkPattern := customPatternForToken(asciiMode.Downlink, customPattern)
+	hint := tableHintFingerprint(key, asciiMode.Canonical(), uplinkPattern, downlinkPattern)
+
+	uplink, err := newSingleDirectionTable(key, asciiMode.uplinkPreference(), uplinkPattern)
+	if err != nil {
+		return nil, err
+	}
+	uplink.hint = hint
+	if asciiMode.Uplink == asciiMode.Downlink {
+		uplink.opposite = uplink
+		return uplink, nil
+	}
+
+	downlink, err := newSingleDirectionTable(key, asciiMode.downlinkPreference(), downlinkPattern)
+	if err != nil {
+		return nil, err
+	}
+	downlink.hint = hint
+	uplink.opposite = downlink
+	downlink.opposite = uplink
+	return uplink, nil
+}
+
+func newSingleDirectionTable(key string, mode string, customPattern string) (*Table, error) {
 	layout, err := resolveLayout(mode, customPattern)
 	if err != nil {
 		return nil, err
@@ -116,7 +146,7 @@ func NewTableWithCustom(key string, mode string, customPattern string) (*Table, 
 			if matchCount == 1 {
 				// 唯一确定，生成最终编码字节
 				for i, p := range rawParts {
-					currentHints[i] = t.layout.encodeHint(p.val-1, p.pos)
+					currentHints[i] = t.layout.hintByte(p.val-1, p.pos)
 				}
 
 				t.EncodeTable[byteVal] = append(t.EncodeTable[byteVal], currentHints)
@@ -126,28 +156,63 @@ func NewTableWithCustom(key string, mode string, customPattern string) (*Table, 
 			}
 		}
 	}
-	log.Printf("[Init] Sudoku Tables initialized (%s) in %v", layout.name, time.Since(start))
 	return t, nil
 }
 
+func customPatternForToken(token string, customPattern string) string {
+	if token == asciiModeTokenEntropy {
+		return customPattern
+	}
+	return ""
+}
+
+func (t *Table) OppositeDirection() *Table {
+	if t == nil || t.opposite == nil {
+		return t
+	}
+	return t.opposite
+}
+
+func (t *Table) Hint() uint32 {
+	if t == nil {
+		return 0
+	}
+	return t.hint
+}
+
+func tableHintFingerprint(key string, mode string, uplinkPattern string, downlinkPattern string) uint32 {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		"sudoku-table-hint",
+		key,
+		mode,
+		strings.ToLower(strings.TrimSpace(uplinkPattern)),
+		strings.ToLower(strings.TrimSpace(downlinkPattern)),
+	}, "\x00")))
+	return binary.BigEndian.Uint32(sum[:4])
+}
+
 func packHintsToKey(hints [4]byte) uint32 {
+	return packHintBytes(hints[0], hints[1], hints[2], hints[3])
+}
+
+func packHintBytes(h0, h1, h2, h3 byte) uint32 {
 	// Sorting network for 4 elements (Bubble sort unrolled)
 	// Swap if a > b
-	if hints[0] > hints[1] {
-		hints[0], hints[1] = hints[1], hints[0]
+	if h0 > h1 {
+		h0, h1 = h1, h0
 	}
-	if hints[2] > hints[3] {
-		hints[2], hints[3] = hints[3], hints[2]
+	if h2 > h3 {
+		h2, h3 = h3, h2
 	}
-	if hints[0] > hints[2] {
-		hints[0], hints[2] = hints[2], hints[0]
+	if h0 > h2 {
+		h0, h2 = h2, h0
 	}
-	if hints[1] > hints[3] {
-		hints[1], hints[3] = hints[3], hints[1]
+	if h1 > h3 {
+		h1, h3 = h3, h1
 	}
-	if hints[1] > hints[2] {
-		hints[1], hints[2] = hints[2], hints[1]
+	if h1 > h2 {
+		h1, h2 = h2, h1
 	}
 
-	return uint32(hints[0])<<24 | uint32(hints[1])<<16 | uint32(hints[2])<<8 | uint32(hints[3])
+	return uint32(h0)<<24 | uint32(h1)<<16 | uint32(h2)<<8 | uint32(h3)
 }

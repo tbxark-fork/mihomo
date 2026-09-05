@@ -45,12 +45,31 @@ func updateTTL(records []D.RR, ttl uint32) {
 	}
 }
 
-func putMsgToCache(c dnsCache, key string, q D.Question, msg *D.Msg) {
+// getMsgFromCache returns a cached dns message if it exists, otherwise returns nil.
+// the returned msg is a copy of the original msg, so it can be modified without affecting the original msg.
+func getMsgFromCache(c dnsCache, q D.Question) (*D.Msg, time.Time, bool) {
+	msg, expireTime, hit := c.GetWithExpire(q.String())
+	if msg != nil {
+		msg = msg.Copy() // never modify the original msg
+	}
+	return msg, expireTime, hit
+}
+
+// putMsgToCache puts a dns message into the cache.
+// the msg is copied before being stored in the cache, so it can be modified without affecting the original msg.
+func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg) {
 	// skip dns cache for acme challenge
 	if q.Qtype == D.TypeTXT && strings.HasPrefix(q.Name, "_acme-challenge.") {
 		log.Debugln("[DNS] dns cache ignored because of acme challenge for: %s", q.Name)
 		return
 	}
+
+	msg = msg.Copy() // never modify the original msg
+
+	// OPT RRs MUST NOT be cached, forwarded, or stored in or loaded from master files.
+	msg.Extra = lo.Filter(msg.Extra, func(rr D.RR, index int) bool {
+		return rr.Header().Rrtype != D.TypeOPT
+	})
 
 	var ttl uint32
 	if msg.Rcode == D.RcodeServerFailure {
@@ -58,12 +77,13 @@ func putMsgToCache(c dnsCache, key string, q D.Question, msg *D.Msg) {
 		// If it does so it MUST NOT cache it for longer than five (5) minutes [...]
 		ttl = serverFailureCacheTTL
 	} else {
-		ttl = minimalTTL(append(append(msg.Answer, msg.Ns...), msg.Extra...))
+		ttl = minimalTTL(lo.Concat(msg.Answer, msg.Ns, msg.Extra))
 	}
 	if ttl == 0 {
 		return
 	}
-	c.SetWithExpire(key, msg.Copy(), time.Now().Add(time.Duration(ttl)*time.Second))
+
+	c.SetWithExpire(q.String(), msg, time.Now().Add(time.Duration(ttl)*time.Second))
 }
 
 func setMsgTTL(msg *D.Msg, ttl uint32) {
@@ -76,6 +96,9 @@ func setMsgTTL(msg *D.Msg, ttl uint32) {
 	}
 
 	for _, extra := range msg.Extra {
+		if extra.Header().Rrtype == D.TypeOPT { // TTL section in OPT is the extended RCODE and flags (RFC 6891), not real TTL value
+			continue
+		}
 		extra.Header().Ttl = ttl
 	}
 }
@@ -90,7 +113,7 @@ func isIPRequest(q D.Question) bool {
 	return q.Qclass == D.ClassINET && (q.Qtype == D.TypeA || q.Qtype == D.TypeAAAA || q.Qtype == D.TypeCNAME)
 }
 
-func transform(servers []NameServer, resolver *Resolver) []dnsClient {
+func transform(servers []NameServer, resolver resolver.Resolver) []dnsClient {
 	ret := make([]dnsClient, 0, len(servers))
 	for _, s := range servers {
 		var c dnsClient
@@ -103,6 +126,8 @@ func transform(servers []NameServer, resolver *Resolver) []dnsClient {
 			c = newDHCPClient(s.Addr)
 		case "system":
 			c = newSystemClient()
+		case "tailscale":
+			c = newTailscaleClient(s.Addr)
 		case "rcode":
 			c = newRCodeClient(s.Addr)
 		case "quic":
@@ -110,13 +135,32 @@ func transform(servers []NameServer, resolver *Resolver) []dnsClient {
 		default:
 			c = newClient(s.Addr, resolver, s.Net, s.Params, s.ProxyAdapter, s.ProxyName)
 		}
-
-		c = warpClientWithEdns0Subnet(c, s.Params)
-		c = warpClientWithDisableTypes(c, s.Params)
-
+		c = rewrapClient(c, s.Params)
 		ret = append(ret, c)
 	}
 	return ret
+}
+
+// rewrapClient peels any existing wrapper layers off c to reach the raw transport
+// client, then re-wraps it according to params. Passing a raw client is fine (the
+// peel is a no-op), which lets a shared raw transport be re-wrapped per name server.
+func rewrapClient(c dnsClient, params map[string]string) dnsClient {
+	for {
+		u, ok := c.(interface{ Unwrap() dnsClient })
+		if !ok {
+			break
+		}
+		c = u.Unwrap()
+	}
+	c = wrapClientWithEdns0Subnet(c, params)
+	c = wrapClientWithDisableTypes(c, params)
+	return c
+}
+
+// isWrapperOnlyParam reports whether a param only affects the wrapper layer and not
+// the transport connection, so it can be ignored when comparing transports.
+func isWrapperOnlyParam(key string) bool {
+	return isDisableTypesParam(key) || isEdns0SubnetParam(key)
 }
 
 type clientWithDisableTypes struct {
@@ -156,7 +200,18 @@ func (c clientWithDisableTypes) inRR(rr D.RR) bool {
 	return ok
 }
 
-func warpClientWithDisableTypes(c dnsClient, params map[string]string) dnsClient {
+func (c clientWithDisableTypes) Unwrap() dnsClient { return c.dnsClient }
+
+// isDisableTypesParam reports the params consumed by wrapClientWithDisableTypes.
+func isDisableTypesParam(key string) bool {
+	switch key {
+	case "disable-ipv4", "disable-ipv6":
+		return true
+	}
+	return strings.HasPrefix(key, "disable-qtype-")
+}
+
+func wrapClientWithDisableTypes(c dnsClient, params map[string]string) dnsClient {
 	disableTypes := make(map[uint16]struct{})
 	if params["disable-ipv4"] == "true" {
 		disableTypes[D.TypeA] = struct{}{}
@@ -195,7 +250,18 @@ func (c clientWithEdns0Subnet) ExchangeContext(ctx context.Context, m *D.Msg) (*
 	return c.dnsClient.ExchangeContext(ctx, m)
 }
 
-func warpClientWithEdns0Subnet(c dnsClient, params map[string]string) dnsClient {
+func (c clientWithEdns0Subnet) Unwrap() dnsClient { return c.dnsClient }
+
+// isEdns0SubnetParam reports the params consumed by wrapClientWithEdns0Subnet.
+func isEdns0SubnetParam(key string) bool {
+	switch key {
+	case "ecs", "ecs-override":
+		return true
+	}
+	return false
+}
+
+func wrapClientWithEdns0Subnet(c dnsClient, params map[string]string) dnsClient {
 	var ecsPrefix netip.Prefix
 	var ecsOverride bool
 	if ecs := params["ecs"]; ecs != "" {
